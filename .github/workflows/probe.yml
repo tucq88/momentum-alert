@@ -1,0 +1,56 @@
+# One-shot probe: can a GitHub-hosted runner reach Binance at all?
+#
+# Binance returns HTTP 451 to US IPs, and GitHub's hosted runners are US-based,
+# so this is the single question that decides whether the whole deployment works.
+# Run it manually (Actions -> Binance reachability probe -> Run workflow) BEFORE
+# relying on the scheduled scan. It tries the main API first, then the public
+# data mirror, and prints which one works.
+name: Binance reachability probe
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Where is this runner?
+        run: curl -s https://ipinfo.io/json || true
+
+      - name: Try api.binance.com, then the data mirror
+        run: |
+          uv run --with ccxt --with pandas python - <<'PY'
+          import ccxt, sys
+
+          ENDPOINTS = [
+              ("api.binance.com (default)", None),
+              ("data-api.binance.vision (public mirror)",
+               "https://data-api.binance.vision/api/v3"),
+          ]
+
+          working = []
+          for label, url in ENDPOINTS:
+              ex = ccxt.binance({"enableRateLimit": True,
+                                 "options": {"defaultType": "spot"}})
+              if url:
+                  ex.urls["api"]["public"] = url
+              try:
+                  bars = ex.fetch_ohlcv("BTC/USDT", "4h", limit=5)
+                  tickers = ex.fetch_tickers()
+                  print(f"OK    {label}: {len(bars)} bars, {len(tickers)} tickers")
+                  working.append(label)
+              except Exception as exc:
+                  detail = str(exc)[:300]
+                  flag = " <- GEOBLOCKED" if "451" in detail else ""
+                  print(f"FAIL  {label}: {type(exc).__name__}{flag}\n      {detail}")
+
+          print()
+          if not working:
+              print("Neither endpoint is reachable from this runner.")
+              print("Use a non-US host (Oracle Cloud Always Free lets you pick a region).")
+              sys.exit(1)
+          print(f"Usable endpoint(s): {', '.join(working)}")
+          PY

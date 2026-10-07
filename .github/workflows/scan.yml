@@ -1,0 +1,80 @@
+# Scheduled scan -> static dashboard on GitHub Pages.
+#
+# Runs every 4 hours, five minutes past, so the 4H candle has definitely closed
+# before we ask for it. The scanner drops any still-forming bar anyway, so a late
+# run is harmless; an early one would simply see one fewer bar.
+#
+# Before trusting this, run the "Binance reachability probe" workflow by hand.
+# GitHub's runners are US-based and Binance answers US IPs with HTTP 451. If the
+# probe says only the mirror works, uncomment BINANCE_PUBLIC_URL below.
+name: RSI scan
+
+on:
+  schedule:
+    - cron: "5 */4 * * *"
+  workflow_dispatch:        # so you can always force a run from the UI
+
+# A cold-cache run takes a couple of minutes; this stops a slow run from
+# overlapping the next schedule and two jobs fighting over the same cache key.
+concurrency:
+  group: rsi-scan
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    env:
+      COINGECKO_API_KEY: ${{ secrets.COINGECKO_API_KEY }}
+      # BINANCE_PUBLIC_URL: https://data-api.binance.vision/api/v3
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      # The candle store. A miss is survivable - the run just refetches the full
+      # window - so this is a speed-up, never a dependency. Note there is no
+      # --offline anywhere below: on a cold cache that would exit fatal and take
+      # the deploy with it.
+      - name: Restore candle cache
+        uses: actions/cache@v4
+        with:
+          path: rsi_cache.sqlite
+          key: rsi-cache-${{ github.run_id }}
+          restore-keys: rsi-cache-
+
+      - name: Scan and build the page
+        run: |
+          ./rsi_scanner.py \
+            --top-n 200 \
+            --timeframes 4h 1d \
+            --lookback-days 30 \
+            --show-mcap \
+            --json site/data.json \
+            --html site/index.html \
+            --csv-dir site/csv
+        # Exit 1 means the scan ran but coverage was low. Publish it anyway -
+        # the page shows a coverage banner - but let the run go red so the
+        # failure is visible in the Actions list. Exit 2 (cannot reach the
+        # exchange) has no page to publish and stops here.
+        continue-on-error: true
+
+      - name: Fail the run if no page was produced
+        run: test -s site/index.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: scan
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - id: deploy
+        uses: actions/deploy-pages@v4

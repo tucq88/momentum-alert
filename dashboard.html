@@ -1,0 +1,261 @@
+<!doctype html>
+<!--
+  dashboard.html - template for the rsi-alert page.
+
+  Built by `rsi_scanner.py --html`, which substitutes two placeholders:
+      __RSI_LOGIC__   the contents of dashboard.js
+      __RSI_DATA__    the scan document as JSON
+
+  The result is one self-contained file: no fetch, no CORS, no second request,
+  and it opens straight from disk. The scan data is already in the page, so the
+  threshold / window / market-cap controls recompute instantly in the browser -
+  the same thing --offline does for the CLI, for anyone with the link.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSI Extremes</title>
+<style>
+  :root {
+    --bg: #0d1117; --panel: #161b22; --line: #30363d;
+    --fg: #e6edf3; --dim: #8b949e;
+    --hot: #ff7b72; --cold: #79c0ff; --ok: #3fb950; --warn: #d29922;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #ffffff; --panel: #f6f8fa; --line: #d0d7de;
+      --fg: #1f2328; --dim: #656d76;
+      --hot: #cf222e; --cold: #0969da; --ok: #1a7f37; --warn: #9a6700;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 1.5rem 1rem 3rem; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; }
+  h1 { font-size: 1.1rem; margin: 0 0 .25rem; letter-spacing: .02em; }
+  .sub { color: var(--dim); margin-bottom: 1.25rem; }
+
+  .banner { padding: .6rem .8rem; border-radius: 6px; margin-bottom: 1rem;
+            border: 1px solid var(--line); background: var(--panel); }
+  .banner.warn { border-color: var(--warn); color: var(--warn); }
+  .banner.bad  { border-color: var(--hot);  color: var(--hot); font-weight: 600; }
+  .banner.hide { display: none; }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 1.25rem; padding: .9rem 1rem;
+              background: var(--panel); border: 1px solid var(--line);
+              border-radius: 6px; margin-bottom: 1rem; }
+  .ctl { display: flex; flex-direction: column; gap: .3rem; }
+  .ctl label { color: var(--dim); font-size: 12px; text-transform: uppercase;
+               letter-spacing: .05em; }
+  .ctl input[type=number], .ctl select {
+    background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+    border-radius: 4px; padding: .3rem .4rem; font: inherit; width: 7rem;
+  }
+  .ctl input[type=range] { width: 11rem; }
+  .val { color: var(--fg); font-variant-numeric: tabular-nums; }
+
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; }
+  table { border-collapse: collapse; width: 100%; white-space: nowrap; }
+  th, td { padding: .45rem .7rem; text-align: left; border-bottom: 1px solid var(--line); }
+  th { background: var(--panel); color: var(--dim); font-weight: 600;
+       font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+       position: sticky; top: 0; }
+  tbody tr:last-child td { border-bottom: none; }
+  tbody tr:hover { background: var(--panel); }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ob { color: var(--hot); } .os { color: var(--cold); }
+  .now { font-weight: 700; }
+  .none { color: var(--dim); }
+  .sym { font-weight: 600; }
+
+  .empty { padding: 2rem 1rem; text-align: center; color: var(--dim); }
+  footer { margin-top: 1rem; color: var(--dim); font-size: 12px; line-height: 1.8; }
+  code { background: var(--panel); padding: .1rem .3rem; border-radius: 3px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>RSI Extremes &mdash; Binance spot</h1>
+  <div class="sub" id="subtitle"></div>
+
+  <div class="banner hide" id="stale"></div>
+  <div class="banner hide" id="coverage"></div>
+
+  <div class="controls">
+    <div class="ctl">
+      <label for="ob">Overbought &ge;</label>
+      <input type="number" id="ob" min="50" max="100" step="1">
+    </div>
+    <div class="ctl">
+      <label for="os">Oversold &le;</label>
+      <input type="number" id="os" min="0" max="50" step="1">
+    </div>
+    <div class="ctl">
+      <label for="days">Lookback <span class="val" id="daysVal"></span></label>
+      <input type="range" id="days" min="1" step="1">
+    </div>
+    <div class="ctl">
+      <label for="mcap">Min market cap</label>
+      <select id="mcap">
+        <option value="0">any</option>
+        <option value="10000000">$10M</option>
+        <option value="50000000">$50M</option>
+        <option value="100000000">$100M</option>
+        <option value="1000000000">$1B</option>
+      </select>
+    </div>
+    <div class="ctl">
+      <label>&nbsp;</label>
+      <span class="val" id="count"></span>
+    </div>
+  </div>
+
+  <div class="scroll"><table>
+    <thead><tr id="head"></tr></thead>
+    <tbody id="body"></tbody>
+  </table></div>
+  <div class="empty hide" id="empty"></div>
+
+  <footer>
+    <div>OB/OS = overbought / oversold &nbsp;&middot;&nbsp;
+         <code>92.2&nbsp;&nbsp;3b&nbsp;-&gt;53</code> = hit 92.2 three bars ago, now 53
+         &nbsp;&middot;&nbsp; <code>NOW</code> = the extreme is the current reading</div>
+    <div>FLOAT = circulating / total supply; a low share means supply still to unlock</div>
+    <div id="through"></div>
+    <div>Closed candles only, so the newest bar is up to one period behind live
+         price. RSI period is fixed at <span id="period"></span> here; rerun the
+         CLI to change it.</div>
+  </footer>
+</div>
+
+<script id="rsi-logic">
+__RSI_LOGIC__
+</script>
+
+<script id="rsi-data" type="application/json">__RSI_DATA__</script>
+
+<script>
+/* DOM layer only. All the arithmetic lives in dashboard.js above, which is
+   tested against the Python implementation it mirrors. */
+(function () {
+  "use strict";
+  var doc = JSON.parse(document.getElementById("rsi-data").textContent);
+  var el = function (id) { return document.getElementById(id); };
+
+  el("period").textContent = doc.rsi_period;
+  el("subtitle").textContent =
+    "generated " + formatUtc(doc.generated_ms) +
+    "  |  " + doc.rows.length + " series  |  " +
+    doc.timeframes.join(", ") + "  |  RSI " + doc.rsi_period;
+
+  /* Staleness: the page's own dead-man switch. If the scheduled job stops
+     firing, nothing else in the system complains. */
+  var stale = staleness(doc, Date.now());
+  if (stale.level !== "ok") {
+    var banner = el("stale");
+    banner.className = "banner " + stale.level;
+    banner.textContent =
+      (stale.level === "bad" ? "STALE: " : "Warning: ") +
+      "data is " + stale.ageHours.toFixed(1) + "h old, but a bar closes every " +
+      stale.expectedHours + "h. The scheduled scan may have stopped " +
+      "(GitHub disables cron after 60 days of repo inactivity).";
+  }
+
+  /* A degraded scan is published, but never silently. */
+  if (doc.health && doc.health.coverage < 0.8) {
+    var cov = el("coverage");
+    cov.className = "banner warn";
+    cov.textContent =
+      "Incomplete scan: " + Math.round(doc.health.coverage * 100) + "% coverage (" +
+      doc.health.failed + " of " + doc.health.total + " tasks failed). " +
+      "Treat this run as unreliable.";
+  }
+
+  var through = {};
+  doc.rows.forEach(function (r) {
+    through[r.timeframe] = Math.max(through[r.timeframe] || 0, r.last_ts);
+  });
+  el("through").textContent = "Closed candles through: " +
+    Object.keys(through).map(function (tf) {
+      return tf.toUpperCase() + " " + formatUtc(through[tf]);
+    }).join("   ");
+
+  var ob = el("ob"), os = el("os"), days = el("days"), mcap = el("mcap");
+  ob.value = doc.defaults.overbought;
+  os.value = doc.defaults.oversold;
+  days.max = doc.max_lookback_days;
+  days.value = doc.defaults.lookback_days;
+  mcap.value = String(doc.defaults.min_market_cap || 0);
+
+  var headCells = ["TOKEN", "SIDE", "MCAP", "FLOAT"]
+    .concat(doc.timeframes.map(function (t) { return t.toUpperCase(); }));
+  el("head").innerHTML = headCells.map(function (h, i) {
+    return "<th" + (i === 2 || i === 3 ? ' class="num"' : "") + ">" + h + "</th>";
+  }).join("");
+
+  function render() {
+    var opts = {
+      overbought: Number(ob.value),
+      oversold: Number(os.value),
+      lookbackDays: Number(days.value),
+      minMarketCap: Number(mcap.value),
+    };
+    el("daysVal").textContent = opts.lookbackDays + "d";
+
+    var rows = toMatrix(computeHits(doc, opts));
+
+    /* A min-cap filter silently swallows coins CoinGecko could not resolve.
+       The CLI reports that count; so should the page, or the universe quietly
+       shrinks and nothing says why. */
+    var hidden = 0;
+    if (opts.minMarketCap > 0) {
+      var seen = {};
+      doc.rows.forEach(function (r) {
+        if (seen[r.symbol]) return;
+        seen[r.symbol] = 1;
+        if (!(r.market_cap > 0)) hidden++;
+      });
+    }
+    el("count").textContent = rows.length + " flagged" +
+      (hidden ? "   (" + hidden + " hidden: no mcap data)" : "");
+
+    el("empty").className = rows.length ? "empty hide" : "empty";
+    if (!rows.length) {
+      el("empty").textContent =
+        "Nothing at these thresholds. The scan ran (" + doc.rows.length +
+        " series, " + Math.round(doc.health.coverage * 100) +
+        "% coverage) - this is a quiet market, not a broken page.";
+    }
+
+    el("body").innerHTML = rows.map(function (row) {
+      var cells = doc.timeframes.map(function (tf) {
+        var hit = row.cells[tf];
+        if (!hit) return '<td class="none">-</td>';
+        var cls = (hit.side === "OVERBOUGHT" ? "ob" : "os") +
+                  (hit.barsAgo === 0 ? " now" : "");
+        return '<td class="' + cls + '" title="' + formatUtc(hit.extremeMs) +
+               '">' + cellText(hit) + "</td>";
+      }).join("");
+      return "<tr>" +
+        '<td class="sym">' + row.symbol.split("/")[0] + "</td>" +
+        '<td class="' + (row.side === "OVERBOUGHT" ? "ob" : "os") + '">' +
+          (row.side === "OVERBOUGHT" ? "OB" : "OS") + "</td>" +
+        '<td class="num">' + formatMoney(row.marketCap) + "</td>" +
+        '<td class="num">' +
+          (row.floatPct ? Math.round(row.floatPct) + "%" : "-") + "</td>" +
+        cells + "</tr>";
+    }).join("");
+  }
+
+  [ob, os, days, mcap].forEach(function (control) {
+    control.addEventListener("input", render);
+    control.addEventListener("change", render);
+  });
+  render();
+})();
+</script>
+</body>
+</html>
