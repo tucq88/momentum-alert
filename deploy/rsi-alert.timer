@@ -1,0 +1,21 @@
+[Unit]
+Description=Run the RSI scan every 4 hours
+Documentation=https://github.com/tucq88/momentum-alert
+
+[Timer]
+# Binance candles close on UTC boundaries, so the schedule is pinned to UTC.
+# Without the suffix systemd uses the server's local time and the run drifts off
+# the candle close -- on a +07 box it would fire at 21:05, 01:05, 05:05 UTC.
+# Five past, so the bar has definitely closed; the scanner drops any still
+# forming bar anyway, so being late is harmless and being early sees one fewer.
+OnCalendar=*-*-* 00/4:05:00 UTC
+
+# If the box was down or asleep at 04:05, run once on the way back up instead of
+# skipping the window. This is the thing plain cron will not do for you.
+Persistent=true
+
+# Stagger slightly so a fleet of these does not hit Binance on the same second.
+RandomizedDelaySec=60
+
+[Install]
+WantedBy=timers.target

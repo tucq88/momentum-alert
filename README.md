@@ -65,7 +65,10 @@ with price and 24h volume.
 | `--keep-unknown-mcap` | off | keep coins CoinGecko has no data for |
 | `--cache-path` / `--no-cache` | `rsi_cache.sqlite` | the candle store |
 | `--offline` / `--refresh` | off | replay from cache / force a full refetch |
-| `--telegram` | off | needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` |
+| `--telegram` | off | send new-signal alerts (needs `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID`) |
+| `--telegram-heartbeat` | off | also send the summary; use on one run a day |
+| `--alert-max-age-bars` | `2` | older crossings are recorded, not notified |
+| `--report` / `--favorable-move` | off / `0` | how past signals turned out |
 | `--min-success-rate` | `0.80` | coverage floor before the run is called broken |
 
 Defaults also live in the config block at the top of `rsi_scanner.py`.
@@ -180,40 +183,93 @@ RSI period is fixed at 14 in the page (changing it needs raw candles, ~20x the
 payload). The lookback slider can narrow below the shipped window but not widen
 past it - bars outside it simply are not in the file.
 
-### Deploying it free
+### Deploying it
 
-GitHub Actions runs the scan every 4 hours and publishes to GitHub Pages. No
-server, no cold starts: 6 runs/day x ~2 min is about 360 minutes a month against
-2000 free for private repos, unlimited for public.
+**GitHub Actions does not work for this.** The probe workflow exists to prove it:
+Binance answers US IPs with HTTP 451, GitHub's runners are US-based, and the
+public data mirror is blocked too. Run `.github/workflows/probe.yml` on any host
+before trusting it -- the same script is what tells you whether a given machine
+can see Binance at all.
 
-**Run `.github/workflows/probe.yml` first** (Actions -> Binance reachability
-probe -> Run workflow). Binance answers US IPs with HTTP 451 and GitHub's runners
-are US-based, so this is the question that decides whether any of it works. The
-probe tries `api.binance.com`, then the public data mirror, and tells you which
-one answered. If only the mirror works, uncomment `BINANCE_PUBLIC_URL` in
-`scan.yml` - the mirror serves the same klines and tickers with no account.
+So the scan runs on a box that can reach Binance. `deploy/` has what that needs:
 
-Then enable Pages (Settings -> Pages -> Source: GitHub Actions) and optionally
-add `COINGECKO_API_KEY` as a repo secret. `scan.yml` handles the rest: it caches
-the candle store between runs, publishes even a degraded scan (the page shows a
-coverage banner) and goes red in the Actions list so you notice.
+```bash
+sudo ./deploy/install.sh         # user, uv, code, units, timer
+sudoedit /etc/rsi-alert.env      # bot token, chat id, RSI_FLAGS
+sudo systemctl start rsi-alert.service
+journalctl -u rsi-alert.service -f
+```
 
-Three things that will bite:
+A systemd timer rather than cron, for three reasons that matter here:
 
-* **Scheduled workflows are disabled after 60 days of repo inactivity.** Nothing
-  runs, so nothing complains - which is why the page carries its own dead-man
-  switch and turns red when the data is older than six bars.
-* **No `--offline` in CI.** A cold Actions cache plus `--offline` exits fatal and
-  takes the deploy with it. A test asserts the flag never appears in the workflow.
-* **Scheduled runs drift** by minutes under load. Harmless at a 4H cadence.
+* `OnCalendar=*-*-* 00/4:05:00 **UTC**` -- candles close on UTC boundaries.
+  Without the suffix systemd uses server local time and a +07 box would fire at
+  21:05/01:05/05:05 UTC, permanently off the close.
+* `Persistent=true` -- if the box was down at 04:05 it runs once on the way back
+  up instead of silently skipping the window. Plain cron will not do this.
+* `SuccessExitStatus=0 1` -- exit 1 means "ran but coverage was low", which is
+  degraded and already warned about over Telegram. Only exit 2 (cannot reach the
+  exchange) shows up in `systemctl --failed`.
 
-If you would rather have a real server, **Oracle Cloud Always Free** is the only
-genuinely perpetual free VM worth pointing at, and you choose the region, which
-sidesteps the geoblock entirely. Avoid Vercel Hobby (cron capped at 2 runs/day,
-functions time out before a 90s scan) and PythonAnywhere free (one daily task,
-whitelist-only outbound HTTP).
+## Alerts
 
-### Keeping the CLI and the page honest
+`--telegram` sends **new signals**, not the watchlist. That distinction is the
+whole design:
+
+`find_hits` answers "what was the most extreme RSI in the last 30 days", which is
+right for a weekly table and useless for notifications -- one spike would re-fire
+every four hours for a month. Alerts use `detect_crossings`, which fires on the
+bar where RSI *entered* extreme territory having not been there the bar before.
+One episode, one signal, one message.
+
+Deduplication is a `UNIQUE(symbol, timeframe, side, signal_ts)` constraint, so
+re-seeing a crossing is a no-op even if a run crashes halfway or fires twice.
+Nothing is marked as notified until the send actually succeeded, so a Telegram
+outage retries on the next run instead of swallowing a signal.
+
+A cold database scanning 30 days finds hundreds of crossings. Those are recorded
+(they seed the outcome history) but written pre-marked as alerted, so the first
+run does not fire 300 messages. Only crossings inside `--alert-max-age-bars`
+(default 2) actually notify.
+
+`--telegram-heartbeat` additionally sends the summary line. Put it on one
+scheduled run a day, so silence still means broken rather than quiet.
+
+## Did the alerts actually work?
+
+Every signal is recorded with its bar and price, and later scored against
+candles the store already holds -- so grading costs no extra requests, and
+history is graded retroactively the moment you have the bars.
+
+```bash
+./rsi_scanner.py --offline --report --no-csv
+```
+
+```
++----+------+------+----+----------+---------+
+| TF | SIDE | BARS |  N | HIT RATE | AVG RET |
++----+------+------+----+----------+---------+
+| 4h | OB   |    5 | 44 |      45% |  +5.91% |
+| 4h | OB   |   20 | 39 |      36% | +16.12% |
++----+------+------+----+----------+---------+
+```
+
+Outcomes store the **raw return** at 1/3/5/10/20 bars. The verdict is applied at
+report time, so `--favorable-move 2` rescores every signal you have ever
+collected against a 2% bar instead of needing a re-collection. Overbought is
+vindicated by a fall, oversold by a rise.
+
+**Read this as a sanity check, not a backtest.** Three limits worth stating:
+
+* Only symbols that were in the scanned universe at the time appear, so the
+  sample inherits whatever `--top-n` was that week.
+* No fees, no slippage, no position sizing.
+* **There is no market baseline yet.** `+16% average return 20 bars after an
+  overbought signal` may simply mean everything rose 16% that month. Until the
+  report compares against a benchmark, treat the absolute returns as
+  descriptive and the *hit rate* as the number with any meaning.
+
+### Keeping the CLI and the page honest### Keeping the CLI and the page honest
 
 The page reimplements the flagging logic in JavaScript, which is the one place
 this tool can disagree with itself: the CLI says a coin tagged 82 nine bars ago,
@@ -269,7 +325,7 @@ BTC/USDT candles and checks shape, strictly increasing timestamps with no gaps,
 and recency.
 
 ```bash
-./test_rsi_scanner.py                      # 93 tests, offline, ~1.5s
+./test_rsi_scanner.py                      # 109 tests, offline, ~1.5s
 RUN_NETWORK_TESTS=1 ./test_rsi_scanner.py  # + the live pull
 ```
 

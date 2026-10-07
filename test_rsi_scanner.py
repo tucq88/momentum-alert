@@ -46,12 +46,16 @@ from rsi_scanner import (
     format_matrix,
     filter_by_market_cap,
     format_money,
+    Signal,
     build_document,
     build_page,
+    detect_crossings,
     dump_json,
     get_candles,
+    format_signal_report,
     hits_from_rsi,
     market_info,
+    signal_alert_message,
     min_offline_bars,
     parse_money,
     ScanHealth,
@@ -1155,6 +1159,197 @@ def test_matrix_reports_data_freshness():
     table = format_matrix([], ["1d"], health)
     assert "No tokens at the extremes." in table
     assert "closed candles through: 1D 2026-09-12 00:00Z" in table
+
+
+# ---------------------------------------------------------------------------
+# Signals: crossings, dedup, outcomes
+# ---------------------------------------------------------------------------
+
+def _cross(rsi, window=None, ob=80.0, os_=20.0, closes=None):
+    return detect_crossings(rsi, "X/USDT", "4h", last_ts=0, step_ms=1,
+                            closes=closes if closes is not None else [1.0] * len(rsi),
+                            window_bars=window or len(rsi),
+                            overbought=ob, oversold=os_)
+
+
+def test_crossing_fires_once_per_episode():
+    """The difference between a watchlist and an alert.
+
+    `find_hits` reports the extreme anywhere in a 30-day window, so one spike
+    would re-fire every run for a month. A crossing fires on entry only.
+    """
+    # Rises into overbought, STAYS there for four bars, leaves, comes back.
+    rsi = [50, 60, 85, 90, 88, 92, 70, 60, 83]
+    sides = [(s.side, s.bars_ago) for s in _cross(rsi)]
+    assert sides == [("OVERBOUGHT", 6), ("OVERBOUGHT", 0)]
+
+
+def test_crossing_detects_both_directions():
+    rsi = [50, 85, 50, 10, 50]
+    assert [s.side for s in _cross(rsi)] == ["OVERBOUGHT", "OVERSOLD"]
+
+
+def test_first_bar_cannot_be_a_crossing():
+    """Starting already extreme proves nothing: we cannot see what came before."""
+    assert _cross([95, 96, 97]) == []
+    assert _cross([5, 4, 3]) == []
+
+
+def test_crossing_is_inclusive_of_the_threshold():
+    assert [s.side for s in _cross([79.9, 80.0])] == ["OVERBOUGHT"]
+    assert _cross([79.9, 79.99]) == []
+    assert [s.side for s in _cross([20.1, 20.0])] == ["OVERSOLD"]
+
+
+def test_crossing_skips_undefined_bars_without_inventing_one():
+    """A gap of undefined RSI must not look like a fresh entry."""
+    assert [s.side for s in _cross([85, None, 90])] == []       # never left
+    assert [s.side for s in _cross([50, None, 90])] == ["OVERBOUGHT"]
+
+
+def test_crossing_respects_the_window():
+    rsi = [50, 95] + [60] * 10
+    assert len(_cross(rsi, window=12)) == 1
+    assert _cross(rsi, window=5) == []
+
+
+def test_crossing_records_timestamp_and_price():
+    rsi = [50, 85, 60]
+    closes = [10.0, 11.0, 12.0]
+    sig = detect_crossings(rsi, "BTC/USDT", "1d", last_ts=1_000_000,
+                           step_ms=1000, closes=closes, window_bars=3)[0]
+    assert sig.bars_ago == 1
+    assert sig.signal_ts == 1_000_000 - 1000      # the crossing bar, not the last
+    assert sig.price == 11.0                      # close of the crossing bar
+    assert sig.rsi == 85
+
+
+def _sig(symbol="BTC/USDT", tf="4h", side="OVERBOUGHT", ts=1_000_000,
+         rsi=85.0, price=100.0, bars_ago=0):
+    return Signal(symbol, tf, side, ts, rsi, price, bars_ago)
+
+
+def test_same_signal_is_never_recorded_twice(tmp_path):
+    """Dedup is what stops one spike alerting every four hours for a month."""
+    store = _store(tmp_path)
+    assert store.record_signals([_sig()], 1, alert_max_age_bars=2) == 1
+    assert store.record_signals([_sig()], 2, alert_max_age_bars=2) == 0
+    assert len(store.unalerted_signals()) == 1
+
+    # A different bar on the same symbol is a different signal.
+    assert store.record_signals([_sig(ts=2_000_000)], 3, alert_max_age_bars=2) == 1
+
+
+def test_old_crossings_are_recorded_but_not_alerted(tmp_path):
+    """A cold database scanning 30 days must not fire 300 messages."""
+    store = _store(tmp_path)
+    store.record_signals(
+        [_sig(ts=1, bars_ago=0), _sig(ts=2, bars_ago=2), _sig(ts=3, bars_ago=9)],
+        now_ms=5, alert_max_age_bars=2)
+
+    pending = [sig.signal_ts for _id, sig in store.unalerted_signals()]
+    assert pending == [1, 2]            # the 9-bar-old one is history, not news
+    total, _scored = store.signal_counts()
+    assert total == 3                   # but it is still recorded for scoring
+
+
+def test_alert_is_retried_until_it_succeeds(tmp_path):
+    """Nothing is marked as notified until the send actually worked."""
+    store = _store(tmp_path)
+    store.record_signals([_sig()], 1, alert_max_age_bars=2)
+    pending = store.unalerted_signals()
+    assert len(pending) == 1
+
+    assert len(store.unalerted_signals()) == 1      # still pending; never sent
+    store.mark_alerted([pending[0][0]], now_ms=99)
+    assert store.unalerted_signals() == []
+
+
+def _seed_candles(store, symbol, tf, start_ts, step, closes):
+    df = pd.DataFrame({"timestamp": [start_ts + i * step for i in range(len(closes))],
+                       "open": closes, "high": closes, "low": closes,
+                       "close": closes, "volume": [1.0] * len(closes)})
+    store.upsert_candles(symbol, tf, df, step, start_ts + len(closes) * step)
+
+
+def test_outcomes_score_against_cached_candles(tmp_path):
+    """Scoring costs no extra requests: the bars are already in the store."""
+    store = _store(tmp_path)
+    step = 14_400_000
+    _seed_candles(store, "BTC/USDT", "4h", 0, step, [100.0, 110.0, 90.0, 80.0])
+    store.record_signals([_sig(ts=0, price=100.0)], 1, alert_max_age_bars=2)
+
+    assert store.evaluate_outcomes({"4h": step}, [1, 3]) == 2
+    rows = dict(store.conn.execute(
+        "SELECT horizon_bars, return_pct FROM outcomes").fetchall())
+    assert rows[1] == pytest.approx(10.0)      # 100 -> 110
+    assert rows[3] == pytest.approx(-20.0)     # 100 -> 80
+
+    # Idempotent: a later run must not rescore or duplicate.
+    assert store.evaluate_outcomes({"4h": step}, [1, 3]) == 0
+
+
+def test_outcomes_wait_for_bars_that_have_not_closed(tmp_path):
+    """A signal still inside its horizon is skipped, not scored as zero."""
+    store = _store(tmp_path)
+    step = 14_400_000
+    _seed_candles(store, "BTC/USDT", "4h", 0, step, [100.0, 110.0])
+    store.record_signals([_sig(ts=0, price=100.0)], 1, alert_max_age_bars=2)
+
+    assert store.evaluate_outcomes({"4h": step}, [1, 20]) == 1    # only the 1-bar
+    _total, scored = store.signal_counts()
+    assert scored == 1
+    # Once the bars exist, the later horizon fills in.
+    _seed_candles(store, "BTC/USDT", "4h", 0, step, [100.0] + [110.0] * 25)
+    assert store.evaluate_outcomes({"4h": step}, [1, 20]) == 1
+
+
+def test_hit_rate_scores_each_side_in_its_own_direction(tmp_path):
+    """Overbought is vindicated by a fall, oversold by a rise."""
+    store = _store(tmp_path)
+    step = 14_400_000
+    _seed_candles(store, "UP/USDT", "4h", 0, step, [100.0, 90.0])    # fell 10%
+    _seed_candles(store, "DN/USDT", "4h", 0, step, [100.0, 90.0])    # fell 10%
+    store.record_signals([_sig(symbol="UP/USDT", ts=0, price=100.0),
+                          _sig(symbol="DN/USDT", side="OVERSOLD", ts=0, price=100.0)],
+                         1, alert_max_age_bars=2)
+    store.evaluate_outcomes({"4h": step}, [1])
+
+    stats = {s["side"]: s for s in store.signal_stats()}
+    assert stats["OVERBOUGHT"]["hit_rate"] == 1.0    # price fell: correct call
+    assert stats["OVERSOLD"]["hit_rate"] == 0.0      # price fell: wrong call
+    assert stats["OVERBOUGHT"]["avg_return"] == pytest.approx(-10.0)
+
+
+def test_favorable_move_rescores_history_without_recollecting(tmp_path):
+    """The verdict is applied at report time, so changing your mind is free."""
+    store = _store(tmp_path)
+    step = 14_400_000
+    _seed_candles(store, "BTC/USDT", "4h", 0, step, [100.0, 99.0])   # fell 1%
+    store.record_signals([_sig(ts=0, price=100.0)], 1, alert_max_age_bars=2)
+    store.evaluate_outcomes({"4h": step}, [1])
+
+    assert store.signal_stats(favorable_move=0.0)[0]["hit_rate"] == 1.0
+    assert store.signal_stats(favorable_move=5.0)[0]["hit_rate"] == 0.0
+
+
+def test_alert_message_names_what_fired():
+    text = signal_alert_message([_sig(symbol="SOL/USDT", rsi=88.5, price=140.25)])
+    assert "1 new signal" in text
+    assert "SOL/USDT" in text and "OVERBOUGHT" in text and "88.5" in text
+
+
+def test_report_states_its_caveats():
+    """A good-looking hit rate must not read as a validated strategy."""
+    empty = format_signal_report([], 0, 0, 0.0)
+    assert "No scored signals yet" in empty
+
+    stats = [{"timeframe": "4h", "side": "OVERBOUGHT", "horizon_bars": 5,
+              "n": 46, "favorable": 21, "avg_return": 5.9, "hit_rate": 21 / 46}]
+    text = format_signal_report(stats, 60, 46, 2.0)
+    assert "46%" in text and "+5.90%" in text
+    assert "no fees" in text and "noise" in text
+    assert "at least 2%" in text
 
 
 # ---------------------------------------------------------------------------

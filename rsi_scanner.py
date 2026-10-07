@@ -75,6 +75,10 @@ QUOTE = "USDT"                   # quote currency for auto symbol selection
 SYMBOLS: list[str] = []          # non-empty overrides the auto top-N selection
 WARMUP_BARS = 250                # extra bars so Wilder's RMA has converged
 MIN_SUCCESS_RATE = 0.80          # below this => loud warning + non-zero exit
+# Bars after a signal at which to measure what happened. Raw returns are stored
+# at each; the verdict is applied at report time (see signal_stats).
+SIGNAL_HORIZONS = (1, 3, 5, 10, 20)
+ALERT_MAX_AGE_BARS = 2           # older crossings are recorded but not notified
 EXCHANGE_ID = "binance"
 OUTPUT_FORMAT = "matrix"         # "matrix" (token x timeframe) or "grouped"
 CACHE_PATH = "rsi_cache.sqlite"  # closed candles, accumulated across runs
@@ -280,6 +284,36 @@ CREATE TABLE IF NOT EXISTS coin_map (
     updated_ms INTEGER
 );
 
+-- One row per crossing INTO extreme territory: the bar where RSI first went
+-- >= overbought (or <= oversold) having not been there the bar before. The
+-- UNIQUE constraint is the whole deduplication mechanism -- re-seeing the same
+-- crossing on the next run is a no-op, so a signal alerts exactly once even if
+-- a run crashes halfway through or fires twice.
+CREATE TABLE IF NOT EXISTS signals (
+    id         INTEGER PRIMARY KEY,
+    symbol     TEXT NOT NULL,
+    timeframe  TEXT NOT NULL,
+    side       TEXT NOT NULL,
+    signal_ts  INTEGER NOT NULL,      -- open time of the crossing bar
+    rsi        REAL,
+    price      REAL,                  -- close of the crossing bar
+    detected_ms INTEGER,              -- when this run first saw it
+    alerted_ms  INTEGER,              -- NULL = never notified
+    UNIQUE (symbol, timeframe, side, signal_ts)
+);
+
+-- What happened after. Raw returns only: whether a move counts as vindication
+-- depends on a horizon and a threshold that belong to a trading view, not to a
+-- schema, so the verdict is computed at report time and can be rescored later
+-- without re-collecting anything.
+CREATE TABLE IF NOT EXISTS outcomes (
+    signal_id    INTEGER NOT NULL,
+    horizon_bars INTEGER NOT NULL,
+    price        REAL,
+    return_pct   REAL,
+    PRIMARY KEY (signal_id, horizon_bars)
+);
+
 CREATE TABLE IF NOT EXISTS marketcaps (
     coin_id       TEXT PRIMARY KEY,
     symbol TEXT, name TEXT,
@@ -402,6 +436,113 @@ class CandleStore:
             f"SELECT symbol, quote_volume FROM symbols WHERE symbol IN ({holes})",
             symbols).fetchall()
         return {symbol: volume or 0.0 for symbol, volume in rows}
+
+    # -- signals and outcomes ---------------------------------------------
+
+    def record_signals(self, signals: list["Signal"], now_ms: int,
+                       alert_max_age_bars: int) -> int:
+        """Store crossings, suppressing alerts for ones that are already old.
+
+        A cold database scanning 30 days finds hundreds of crossings. They are
+        all worth recording -- they seed the outcome history -- but notifying
+        about a signal from three weeks ago is noise, so anything older than
+        `alert_max_age_bars` is written pre-marked as alerted. Returns how many
+        rows were new; re-seeing a crossing is a no-op.
+        """
+        inserted = 0
+        for sig in signals:
+            backfill = sig.bars_ago > alert_max_age_bars
+            cursor = self.conn.execute(
+                """INSERT OR IGNORE INTO signals
+                   (symbol, timeframe, side, signal_ts, rsi, price,
+                    detected_ms, alerted_ms)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (sig.symbol, sig.timeframe, sig.side, sig.signal_ts, sig.rsi,
+                 sig.price, now_ms, now_ms if backfill else None))
+            inserted += cursor.rowcount
+        self.conn.commit()
+        return inserted
+
+    def unalerted_signals(self) -> list[tuple[int, "Signal"]]:
+        """Signals recorded but never notified.
+
+        Separate from recording so a failed send is retried next run rather than
+        lost: nothing is marked alerted until it actually went out.
+        """
+        rows = self.conn.execute(
+            """SELECT id, symbol, timeframe, side, signal_ts, rsi, price
+               FROM signals WHERE alerted_ms IS NULL
+               ORDER BY signal_ts""").fetchall()
+        return [(r[0], Signal(symbol=r[1], timeframe=r[2], side=r[3],
+                              signal_ts=r[4], rsi=r[5], price=r[6])) for r in rows]
+
+    def mark_alerted(self, ids: list[int], now_ms: int) -> None:
+        self.conn.executemany("UPDATE signals SET alerted_ms = ? WHERE id = ?",
+                              [(now_ms, i) for i in ids])
+        self.conn.commit()
+
+    def evaluate_outcomes(self, steps: dict[str, int],
+                          horizons: "Sequence[int]") -> int:
+        """Score past signals against candles already in the store.
+
+        Costs nothing extra: the bars needed to judge a signal from last week are
+        the same bars this week's scan just fetched. Only pairs that have a bar
+        at exactly the target offset are scored, so a signal still inside its
+        horizon is simply skipped and picked up on a later run.
+        """
+        written = 0
+        for timeframe, step_ms in steps.items():
+            for horizon in horizons:
+                rows = self.conn.execute(
+                    """SELECT s.id, s.price, c.close
+                       FROM signals s
+                       JOIN candles c
+                         ON c.symbol = s.symbol AND c.timeframe = s.timeframe
+                        AND c.ts = s.signal_ts + ? * ?
+                      WHERE s.timeframe = ?
+                        AND s.price > 0
+                        AND NOT EXISTS (SELECT 1 FROM outcomes o
+                                        WHERE o.signal_id = s.id
+                                          AND o.horizon_bars = ?)""",
+                    (horizon, step_ms, timeframe, horizon)).fetchall()
+                self.conn.executemany(
+                    """INSERT OR IGNORE INTO outcomes
+                       (signal_id, horizon_bars, price, return_pct)
+                       VALUES (?, ?, ?, ?)""",
+                    [(sid, horizon, close, 100.0 * (close - price) / price)
+                     for sid, price, close in rows])
+                written += len(rows)
+        self.conn.commit()
+        return written
+
+    def signal_stats(self, favorable_move: float = 0.0) -> list[dict]:
+        """Hit rate per (timeframe, side, horizon), scored at report time.
+
+        `favorable_move` is the move required to call a signal vindicated, in
+        percent: overbought wants price *down* by at least that much, oversold
+        wants it up. Scoring here rather than at collection time means changing
+        your mind rescores history instead of needing to re-collect it.
+        """
+        rows = self.conn.execute(
+            """SELECT s.timeframe, s.side, o.horizon_bars,
+                      COUNT(*) AS n,
+                      SUM(CASE WHEN (s.side = 'OVERBOUGHT' AND o.return_pct <= -?)
+                                 OR (s.side = 'OVERSOLD'   AND o.return_pct >=  ?)
+                               THEN 1 ELSE 0 END) AS favorable,
+                      AVG(o.return_pct) AS avg_return
+                 FROM outcomes o JOIN signals s ON s.id = o.signal_id
+                GROUP BY s.timeframe, s.side, o.horizon_bars
+                ORDER BY s.timeframe, s.side, o.horizon_bars""",
+            (favorable_move, favorable_move)).fetchall()
+        return [{"timeframe": r[0], "side": r[1], "horizon_bars": r[2],
+                 "n": r[3], "favorable": r[4], "avg_return": r[5],
+                 "hit_rate": r[4] / r[3] if r[3] else 0.0} for r in rows]
+
+    def signal_counts(self) -> tuple[int, int]:
+        total = self.conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+        scored = self.conn.execute(
+            "SELECT COUNT(DISTINCT signal_id) FROM outcomes").fetchone()[0]
+        return total, scored
 
     # -- market cap -------------------------------------------------------
 
@@ -855,6 +996,65 @@ def hits_from_rsi(rsi: "Sequence[float | None]", symbol: str, timeframe: str,
     return hits
 
 
+@dataclass
+class Signal:
+    """A crossing into extreme territory. One episode, one signal, one alert."""
+    symbol: str
+    timeframe: str
+    side: str              # "OVERBOUGHT" or "OVERSOLD"
+    signal_ts: int         # open time of the crossing bar
+    rsi: float
+    price: float
+    bars_ago: int = 0      # relative to the latest closed bar, at detection time
+
+
+def detect_crossings(rsi: "Sequence[float | None]", symbol: str, timeframe: str,
+                     last_ts: int, step_ms: int, closes: "Sequence[float]",
+                     window_bars: int, overbought: float = OVERBOUGHT,
+                     oversold: float = OVERSOLD) -> list[Signal]:
+    """Bars where RSI *entered* extreme territory.
+
+    Different question from `hits_from_rsi`, and the difference is the whole
+    point of alerting. "Most extreme RSI in the last 30 days" is the right answer
+    for a weekly watchlist and the wrong one for notifications: a single spike
+    would re-fire every four hours for a month. A crossing -- at or beyond the
+    threshold when the previous defined bar was not -- fires once per episode.
+
+    A bar with no previous defined value (start of the series) cannot be a
+    crossing: we have no idea whether it had just arrived or had been sitting
+    there for a week.
+    """
+    signals: list[Signal] = []
+    last_index = len(rsi) - 1
+    start = max(1, len(rsi) - window_bars)
+
+    for i in range(start, len(rsi)):
+        value = rsi[i]
+        if value is None:
+            continue
+        # Nearest earlier defined value, so a gap of undefined bars does not
+        # manufacture a crossing out of nothing.
+        previous = next((rsi[j] for j in range(i - 1, -1, -1) if rsi[j] is not None),
+                        None)
+        if previous is None:
+            continue
+
+        for side, threshold, entered in (
+            ("OVERBOUGHT", overbought, value >= overbought and previous < overbought),
+            ("OVERSOLD", oversold, value <= oversold and previous > oversold),
+        ):
+            if not entered:
+                continue
+            bars_ago = last_index - i
+            signals.append(Signal(
+                symbol=symbol, timeframe=timeframe, side=side,
+                signal_ts=last_ts - bars_ago * step_ms,
+                rsi=float(value),
+                price=float(closes[i]) if i < len(closes) else 0.0,
+                bars_ago=bars_ago))
+    return signals
+
+
 def rsi_series(df: pd.DataFrame, period: int = RSI_PERIOD) -> list[float | None]:
     """RSI over a candle frame as a plain list, NaN rendered as None."""
     values = wilder_rsi(df["close"].reset_index(drop=True), period)
@@ -904,7 +1104,8 @@ def scan(exchange: ccxt.Exchange, symbols: list[str], timeframes: list[str],
          args: argparse.Namespace, volumes: dict[str, float] | None = None,
          store: "CandleStore | None" = None, offline: bool = False,
          refresh: bool = False,
-         series_out: list[dict] | None = None) -> tuple[list[Hit], ScanHealth]:
+         series_out: list[dict] | None = None,
+         signals_out: list[Signal] | None = None) -> tuple[list[Hit], ScanHealth]:
     """Scan every (symbol, timeframe) pair. Never raises for a single symbol.
 
     Pass `series_out` to also collect the RSI series of every symbol that
@@ -933,8 +1134,15 @@ def scan(exchange: ccxt.Exchange, symbols: list[str], timeframes: list[str],
                 found = find_hits(df, symbol, timeframe, window, args.rsi_period,
                                   args.overbought, args.oversold,
                                   volumes.get(symbol, 0.0))
+                step_ms = int(df["timestamp"].iloc[-1]) - int(df["timestamp"].iloc[-2])
+                if signals_out is not None:
+                    # Crossings, not window extremes: see detect_crossings().
+                    signals_out.extend(detect_crossings(
+                        rsi_series(df, args.rsi_period), symbol, timeframe,
+                        last_ts=int(df["timestamp"].iloc[-1]), step_ms=step_ms,
+                        closes=df["close"].tolist(), window_bars=window,
+                        overbought=args.overbought, oversold=args.oversold))
                 if series_out is not None:
-                    step_ms = int(df["timestamp"].iloc[-1]) - int(df["timestamp"].iloc[-2])
                     series_out.append({
                         "symbol": symbol,
                         "timeframe": timeframe,
@@ -1214,6 +1422,50 @@ def telegram_message(hits: list[Hit], health: ScanHealth, args: argparse.Namespa
 
 
 # ---------------------------------------------------------------------------
+# Signal alerts and scoring
+# ---------------------------------------------------------------------------
+
+def signal_alert_message(signals: list[Signal]) -> str:
+    """Telegram text for newly crossed signals."""
+    lines = [f"RSI alert: {len(signals)} new signal(s)"]
+    for sig in signals:
+        when = datetime.fromtimestamp(sig.signal_ts / 1000, tz=timezone.utc)
+        arrow = "^" if sig.side == "OVERBOUGHT" else "v"
+        lines.append(f"{arrow} {sig.symbol} {sig.timeframe} {sig.side} "
+                     f"RSI {sig.rsi:.1f} @ {sig.price:.8g} "
+                     f"({when:%Y-%m-%d %H:%M}Z)")
+    return "\n".join(lines)
+
+
+def format_signal_report(stats: list[dict], total: int, scored: int,
+                         favorable_move: float) -> str:
+    """How the alerts have actually done.
+
+    Read this as a sanity check, not a backtest -- the caveats printed under the
+    table are not boilerplate, they are the reason a good-looking number here
+    does not mean a good strategy.
+    """
+    out = ["", f"=== Signal outcomes ({scored} of {total} signals scored) ==="]
+    if not stats:
+        out.append("  No scored signals yet. Outcomes appear once enough bars")
+        out.append("  have closed after a signal -- 20 bars on 1D is 20 days.")
+        return "\n".join(out)
+
+    rule = (f"price moves at least {favorable_move:g}% the right way"
+            if favorable_move else "price moves the right way at all")
+    headers = ["TF", "SIDE", "BARS", "N", "HIT RATE", "AVG RET"]
+    rows = [[s["timeframe"], "OB" if s["side"] == "OVERBOUGHT" else "OS",
+             str(s["horizon_bars"]), str(s["n"]),
+             f"{s['hit_rate']:.0%}", f"{s['avg_return']:+.2f}%"] for s in stats]
+    out.extend(_ascii_table(headers, rows, ["<", "<", ">", ">", ">", ">"]))
+    out.append(f"  Vindicated = {rule}; overbought wants price down, oversold up.")
+    out.append("  Caveats that matter: only symbols that were in the scanned")
+    out.append("  universe at the time appear here, there are no fees or")
+    out.append("  slippage, and a hit rate over a few dozen samples is noise.")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
 # JSON document (input to the dashboard)
 # ---------------------------------------------------------------------------
 
@@ -1377,7 +1629,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--csv-dir", default=CSV_DIR, help="where to write the CSV")
     parser.add_argument("--no-csv", action="store_true", help="skip the CSV file")
     parser.add_argument("--telegram", action="store_true",
-                        help="also send the summary to Telegram (needs env vars)")
+                        help="send NEW signal alerts to Telegram (needs env vars)")
+    parser.add_argument("--telegram-heartbeat", action="store_true",
+                        help="also send the summary line; put this on one "
+                             "scheduled run a day so silence still means broken")
+    parser.add_argument("--alert-max-age-bars", type=int, default=ALERT_MAX_AGE_BARS,
+                        help="crossings older than this are recorded but not "
+                             "notified, so a cold database does not flood you")
+    parser.add_argument("--report", action="store_true",
+                        help="print how past signals actually turned out")
+    parser.add_argument("--favorable-move", type=float, default=0.0, metavar="PCT",
+                        help="percent move required to call a signal vindicated")
     parser.add_argument("--min-success-rate", type=float, default=MIN_SUCCESS_RATE,
                         help="warn + exit non-zero below this scan coverage")
     parser.add_argument("--verbose", action="store_true", help="debug logging")
@@ -1481,12 +1743,26 @@ def main(argv: list[str] | None = None) -> int:
     # The page needs every scanned symbol, so its controls can widen into ones
     # this run did not flag. Only collected when something will consume it.
     series: list[dict] | None = [] if (args.json or args.html) else None
+    # Crossings are collected whenever there is somewhere to put them: recording
+    # costs nothing and it is what builds the outcome history, so the question
+    # "do these alerts actually work" has data behind it a month from now.
+    crossings: list[Signal] | None = [] if store else None
     hits, health = scan(exchange, symbols, args.timeframes, args, volumes,
                         store=store, offline=args.offline, refresh=args.refresh,
-                        series_out=series)
+                        series_out=series, signals_out=crossings)
+    # --- signals: record, score, then alert ---------------------------------
+    pending: list[tuple[int, Signal]] = []
+    if store and crossings is not None:
+        now_ms = int(time.time() * 1000)
+        new_count = store.record_signals(crossings, now_ms, args.alert_max_age_bars)
+        steps = {tf: timeframe_seconds(exchange, tf) * 1000 for tf in args.timeframes}
+        scored = store.evaluate_outcomes(steps, SIGNAL_HORIZONS)
+        pending = store.unalerted_signals()
+        log.info("signals: %d new, %d outcome(s) scored, %d awaiting alert",
+                 new_count, scored, len(pending))
+
     if store:
         log.info("cache %s", store.stats())
-        store.close()
 
     # Attach size data to the flagged rows so it reaches the table and the CSV.
     for hit in hits:
@@ -1535,12 +1811,31 @@ def main(argv: list[str] | None = None) -> int:
         print("=" * 72)
         exit_code = EXIT_LOW_COVERAGE
 
-    if args.telegram:
-        if send_telegram(telegram_message(hits, health, args)):
-            log.info("telegram summary sent")
-        else:
-            log.error("telegram summary NOT sent")
+    if args.report and store:
+        total, scored_n = store.signal_counts()
+        print(format_signal_report(store.signal_stats(args.favorable_move),
+                                   total, scored_n, args.favorable_move))
 
+    if args.telegram:
+        # Alerts first: these are the point. Nothing is marked as notified until
+        # the send actually succeeded, so a Telegram outage retries next run
+        # instead of silently swallowing a signal.
+        if pending:
+            if send_telegram(signal_alert_message([sig for _id, sig in pending])):
+                store.mark_alerted([sid for sid, _sig in pending],
+                                   int(time.time() * 1000))
+                log.info("alerted %d new signal(s)", len(pending))
+            else:
+                log.error("alert NOT sent; will retry next run")
+        if health.success_rate < args.min_success_rate:
+            send_telegram(f"RSI scan degraded: coverage "
+                          f"{health.success_rate:.0%} ({health.failed} of "
+                          f"{health.total} tasks failed)")
+        if args.telegram_heartbeat:
+            send_telegram(telegram_message(hits, health, args))
+
+    if store:
+        store.close()
     return exit_code
 
 

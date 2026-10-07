@@ -1,0 +1,33 @@
+[Unit]
+Description=RSI extremes scan and alert
+Documentation=https://github.com/tucq88/momentum-alert
+# Do not start before the network can actually resolve and route.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=rsi
+Group=rsi
+WorkingDirectory=/var/lib/rsi-alert
+EnvironmentFile=/etc/rsi-alert.env
+ExecStart=/bin/sh -c '/opt/rsi-alert/rsi_scanner.py $RSI_FLAGS'
+
+# Exit 1 means the scan ran but coverage was below the floor: degraded, not
+# broken, and it already warned over Telegram. Exit 2 (cannot reach the
+# exchange) is a real failure and should show up in `systemctl --failed`.
+SuccessExitStatus=0 1
+
+# A cold cache fetches 200 symbols; a stuck socket must not wedge the timer.
+TimeoutStartSec=900
+
+# Nothing here needs privileges beyond its own state directory.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/rsi-alert
+StateDirectory=rsi-alert
+
+[Install]
+WantedBy=multi-user.target
